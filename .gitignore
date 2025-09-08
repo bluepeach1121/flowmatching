@@ -1,0 +1,11 @@
+flowmatching/config.yaml
+
+flowmatching/runs/sr_x4/config.used.yaml
+flowmatching/runs/sr_x4/checkpoints/
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+

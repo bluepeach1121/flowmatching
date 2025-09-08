@@ -1,0 +1,38 @@
+paths:
+  train_hr_dir: "<PATH_TO_DIV2K_TRAIN_HR>"
+  valid_hr_dir: "<PATH_TO_DIV2K_VALID_HR>"
+  exp_dir: "./runs/sr_x4"
+
+data:
+  scale: 4                 # x4 super-resolution
+  hr_crop: 192             
+  batch_size: 4           
+  grad_accum: 4        
+  num_workers: 2
+  augment:
+    hflip: true
+    rot90: true
+
+train:
+  max_steps: 1000
+  log_every: 50
+  lr: 0.0002
+  optimizer: adamw
+  ema_decay: 0.999
+  amp: true               
+  grad_clip: 1.0
+  grad_checkpoint: true    
+
+fm:
+  path: diffusion
+  sampler_default_steps: 8 
+
+eval:
+  every_steps: 50
+  metrics: [psnr, ssim]
+  save_grids: true
+  report_html: true
+
+inference:
+  tile: 192
+  overlap: 16

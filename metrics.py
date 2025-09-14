@@ -1,9 +1,7 @@
 """
-Simple image metrics for quick validation.
-
 We keep these fast and dependency-light:
 - PSNR on [0,1] RGB
-- SSIM (very lightweight approximation), averaged over RGB
+- SSIM (lightweight approximation), averaged over RGB
 
 All functions accept tensors in shape (B,3,H,W) and return Python floats.
 """

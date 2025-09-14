@@ -6,10 +6,6 @@ We start with a simple **linear path** from Gaussian noise -> HR image:
 The target velocity is constant along the path:
     v*(x_t, t) = d/dt x_t = x_hr - z
 
-Why start here?
-- It's stable, easy to reason about, and works well with few-step Euler sampling.
-- We can add a variance-preserving "diffusion-style" path later without changing the trainer.
-
 API summary:
 - sample_timesteps(batch) -> (B,) in [0,1]
 - prepare_linear_path(x_hr, t, generator) -> x_t, v_target, z
@@ -25,9 +21,6 @@ import torch
 import torch.nn.functional as F
 
 
-# --------------------------
-# Timestep sampling
-# --------------------------
 
 def sample_timesteps(batch_size: int, device: torch.device, eps: float = 1e-5) -> torch.Tensor:
     """
@@ -38,11 +31,6 @@ def sample_timesteps(batch_size: int, device: torch.device, eps: float = 1e-5) -
     if eps > 0:
         t = t.clamp(min=eps, max=1.0 - eps)
     return t
-
-
-# --------------------------
-# Paths & training targets
-# --------------------------
 
 def prepare_linear_path(
     x_hr: torch.Tensor,
@@ -86,20 +74,12 @@ def fm_training_targets(
     """
     Build (x_t, v_target, z) for the requested path.
     Currently supported: 'linear' (noise -> data).
-
-    Later extension idea (not implemented yet, by design for clarity):
-    - 'vp': variance-preserving diffusion-style path x_t = alpha(t) x_hr + sigma(t) eps,
-            with v_target = alpha'(t) x_hr + sigma'(t) eps.
     """
     path = path.lower()
     if path == "linear":
         return prepare_linear_path(x_hr, t, generator)
     raise ValueError(f"Unsupported fm path: {path!r}")
 
-
-# --------------------------
-# Few-step Euler sampler
-# --------------------------
 
 @torch.no_grad()
 def euler_sampler(
@@ -138,7 +118,6 @@ def euler_sampler(
         v_hat = model(x, x_lr, t)  # predict velocity
         x = x + dt * v_hat
 
-    # Clamp to valid image range
     return x.clamp(0.0, 1.0)
 
 

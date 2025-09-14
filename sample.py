@@ -5,7 +5,7 @@ Usage:
   python sample.py --config config.yaml --ckpt runs/sr_x4/checkpoints/step_10000.pt
   python sample.py --config config.yaml --ckpt <ckpt> --steps 4
   # Optional: choose a different set of HR images to evaluate
-  python sample.py --config config.yaml --ckpt <ckpt> --hr_dir "C:\\path\\to\\some_HR_images"
+  python sample.py --config config.yaml --ckpt <ckpt> --hr_dir "/path/to/some_HR_images"
 
 Behavior:
 - Reads HR images from config.paths.valid_hr_dir (or --hr_dir if provided)
@@ -20,7 +20,6 @@ import argparse
 from pathlib import Path
 from typing import List
 
-import re
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -37,10 +36,13 @@ VALID_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
 
 def list_images(root: Path) -> List[Path]:
-    return [p for p in sorted(root.iterdir()) if p.suffix.lower() in VALID_EXTS]
+    root = Path(root)
+    out: List[Path] = []
+    for ext in VALID_EXTS:
+        out.extend(root.rglob(f"*{ext}"))
+    return sorted(out)
 
 
-@torch.no_grad()
 def load_model(config, ckpt_path: Path, device: torch.device) -> UNetSR:
     """Instantiate UNetSR and load weights (EMA preferred if available)."""
     model = UNetSR(
@@ -48,10 +50,9 @@ def load_model(config, ckpt_path: Path, device: torch.device) -> UNetSR:
         out_channels=3,
         base_channels=48,
         channel_multipliers=(1, 2, 4),
-        num_res_blocks=2,
-        time_dim=256,
-        use_bottleneck_attention=True,
-        use_gradient_checkpointing=False,  # not needed for inference
+        # New API (no FiLM/attention):
+        num_blocks=int(config.get("model", {}).get("num_blocks", 2)),
+        groups=int(config.get("model", {}).get("groups", 8)),
     ).to(device)
 
     ckpt = torch.load(ckpt_path, map_location=device)
@@ -60,8 +61,10 @@ def load_model(config, ckpt_path: Path, device: torch.device) -> UNetSR:
         model.load_state_dict({**model.state_dict(), **ckpt["ema"]}, strict=False)
         print(f"[load] EMA weights loaded from {ckpt_path.name}")
     else:
-        model.load_state_dict(ckpt["model"], strict=True)
-        print(f"[load] model weights loaded from {ckpt_path.name}")
+        # Be tolerant if old checkpoints had extra keys
+        state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        model.load_state_dict(state, strict=False)
+        print(f"[load] model weights loaded from {ckpt_path.name} (strict=False)")
 
     model.eval()
     return model
@@ -92,18 +95,16 @@ def compute_starts(length: int, tile: int, overlap: int) -> List[int]:
 @torch.no_grad()
 def sr_tiled(
     model: UNetSR,
-    lr_img: torch.Tensor,               # (3, h, w) in [0,1]
+    lr_img: torch.Tensor,       # (3,h,w) in [0,1]
     steps: int,
     tile_hr: int,
     overlap_hr: int,
-    scale: int = 4,
+    scale: int,
     device: torch.device | None = None,
 ) -> torch.Tensor:
     """
-    Tiled SR to avoid OOM on large images.
-    - We tile in LR space (tile_lr = tile_hr/scale), run the model per tile, and stitch in HR space.
-    - Overlaps are averaged to hide seams.
-    Returns (3, H, W) in [0,1].
+    Few-step SR with sliding-window tiling to fit in memory.
+    Returns a (3,H,W) tensor in [0,1].
     """
     assert lr_img.dim() == 3, "Expected (3, h, w)"
     device = device or (lr_img.device if lr_img.is_cuda else torch.device("cpu"))
@@ -135,73 +136,39 @@ def sr_tiled(
             acc[:, :, Y0:Y1, X0:X1] += sr_tile
             acc_w[:, :, Y0:Y1, X0:X1] += 1.0
 
-    sr_full = acc / acc_w.clamp_min(1.0)
-    return sr_full.squeeze(0).clamp(0, 1)
+    # Normalize overlaps
+    sr = acc / acc_w.clamp_min(1e-8)
+    return sr.squeeze(0).clamp(0.0, 1.0)
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=str, required=True)
-    ap.add_argument("--ckpt", type=str, required=True, help="Path to checkpoint .pt")
-    ap.add_argument("--steps", type=int, default=None, help="Override number of Euler steps")
-    ap.add_argument("--hr_dir", type=str, default=None,
-                    help="Optional directory of HR images; if omitted, uses config.paths.valid_hr_dir")
-    ap.add_argument("--limit", type=int, default=5,
-                help="How many images to process (default 5). Ignored if --images is provided.")
-    ap.add_argument("--images", type=str, default=None,
-                    help="Comma-separated image names or filepaths to process (e.g., '0801,0805.png,C:\\img\\a.jpg').")
-    
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True, help="Path to YAML config.")
+    parser.add_argument("--ckpt", type=str, required=True, help="Path to checkpoint .pt")
+    parser.add_argument("--steps", type=int, default=None, help="Few-step sampler steps (overrides config)")
+    parser.add_argument("--hr_dir", type=str, default=None, help="Override: folder of HR images to evaluate")
+    parser.add_argument("--tile_hr", type=int, default=256, help="HR tile size for tiling inference")
+    parser.add_argument("--overlap_hr", type=int, default=64, help="HR overlap between tiles")
+    args = parser.parse_args()
 
     config = load_config(args.config)
     device = get_device()
 
-    steps = args.steps if args.steps is not None else int(config["fm"]["sampler_default_steps"])
     scale = int(config["data"]["scale"])
-    tile_hr = int(config["inference"]["tile"])
-    overlap_hr = int(config["inference"]["overlap"])
+    steps = int(args.steps or config["fm"].get("sampler_default_steps", 4))
 
-    # Inputs/outputs
-    hr_root = Path(args.hr_dir) if args.hr_dir else Path(config["paths"]["valid_hr_dir"])
-    assert hr_root.exists(), f"HR directory not found: {hr_root}"
-    out_dir = Path(config["paths"]["exp_dir"]) / "samples"
+    # I/O
+    exp_dir = Path(config["paths"]["exp_dir"])
+    out_dir = exp_dir / "samples"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Model
-    ckpt_path = Path(args.ckpt)
-    assert ckpt_path.exists(), f"Checkpoint not found: {ckpt_path}"
-    model = load_model(config, ckpt_path, device)
+    model = load_model(config, Path(args.ckpt), device)
+    model.eval()
 
-    # Process images
+    hr_root = Path(args.hr_dir) if args.hr_dir else Path(config["paths"]["valid_hr_dir"])
     img_paths = list_images(hr_root)
-    # Choose which images to process
-    if args.images:
-        tokens = [t.strip() for t in re.split(r"[;,]", args.images) if t.strip()]
-        selected = []
-        seen = set()
-        for tok in tokens:
-            cand = Path(tok)
-            if cand.exists() and cand.is_file():
-                key = cand.resolve()
-                if key not in seen:
-                    selected.append(cand)
-                    seen.add(key)
-                continue
-            # match by name or stem within hr_root
-            matches = [p for p in img_paths if p.name.lower() == tok.lower() or p.stem.lower() == tok.lower()]
-            if matches:
-                key = matches[0].resolve()
-                if key not in seen:
-                    selected.append(matches[0])
-                    seen.add(key)
-            else:
-                print(f"[warn] No match for '{tok}' in {hr_root}. Skipping.")
-        img_paths = selected
-    else:
-        img_paths = img_paths[: args.limit]
-
-    print(f"[sample] {len(img_paths)} images | steps={steps} | tile={tile_hr}, overlap={overlap_hr}")
-
+    if not img_paths:
+        raise FileNotFoundError(f"No images found in {hr_root}")
 
     for p in img_paths:
         # --- Load HR as tensor in [0,1] ---
@@ -217,14 +184,14 @@ def main():
         )
         sr_t = sr_tiled(
             model, lr_t, steps=steps,
-            tile_hr=tile_hr, overlap_hr=overlap_hr,
+            tile_hr=args.tile_hr, overlap_hr=args.overlap_hr,
             scale=scale, device=device
         )
 
         # --- Bicubic upsample baseline back to HR size ---
         bicubic_t = F.interpolate(
             lr_t.unsqueeze(0), size=hr_t.shape[-2:], mode="bicubic", align_corners=False
-        ).squeeze(0)
+        ).squeeze(0).clamp(0, 1)
 
         # --- Save: bicubic, SR, and a 3-panel grid [bicubic | SR | HR] ---
         stem = p.stem

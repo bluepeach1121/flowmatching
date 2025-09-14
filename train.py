@@ -2,7 +2,7 @@
 Training script for x4 Super-Resolution via Flow Matching.
 
 - Data: on-the-fly LR from HR (crop-based) via data.py
-- Model: UNetSR with LR concatenation + FiLM time conditioning (model.py)
+- Model: UNetSR with LR concatenation (no FiLM/attention) — see model.py
 - FM: linear noise->data path targets (flowmatch.py)
 - AMP: torch.autocast(device_type="cuda", dtype=torch.float16) + torch.amp.GradScaler
 - EMA: exponential moving average of weights
@@ -23,19 +23,23 @@ from typing import Dict, Any
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.amp import GradScaler # type: ignore
+from torch.amp import GradScaler  # type: ignore
+#for some reason, Im getting an issue that torch.amp.GradScaler is outdated
 from tqdm.auto import tqdm
 
 from metrics import psnr, ssim
 from data import make_dataloader
 from model import UNetSR
 from flowmatch import sample_timesteps, fm_training_targets, euler_sampler
-from utils import load_config, seed_everything, get_device, prepare_experiment_dir, human_readable_num
+from utils import (
+    load_config,
+    seed_everything,
+    get_device,
+    prepare_experiment_dir,
+    human_readable_num,
+)
 
 
-# -------------------------
-# EMA
-# -------------------------
 
 class EMA:
     """Simple exponential moving average over floating-point parameters."""
@@ -55,14 +59,11 @@ class EMA:
 
     @torch.no_grad()
     def copy_to(self, model: nn.Module) -> None:
-        for k, v in model.state_dict().items():
-            if k in self.shadow and v.dtype.is_floating_point:
-                v.copy_(self.shadow[k])
+        msd = model.state_dict()
+        for k, v in self.shadow.items():
+            if k in msd and msd[k].dtype.is_floating_point:
+                msd[k].copy_(v)
 
-
-# -------------------------
-# I/O helpers
-# -------------------------
 
 def save_checkpoint(
     exp_dir: Path,
@@ -81,13 +82,9 @@ def save_checkpoint(
         "scaler": scaler.state_dict(),
     }
     path = exp_dir / "checkpoints" / f"step_{step}.pt"
+    path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path)
     log_fn(f"[ckpt] saved {path}")
-
-
-# -------------------------
-# Validation
-# -------------------------
 
 @torch.no_grad()
 def validate(
@@ -96,63 +93,41 @@ def validate(
     val_loader,
     device: torch.device,
     steps: int,
-    max_batches: int = 4,
+    scale: int,
+    max_batches: int = 10,
 ) -> Dict[str, float]:
-    """
-    Evaluate PSNR/SSIM using EMA weights and a few-step Euler sampler.
-    To keep it fast, we only run on a handful of validation batches.
-    """
-    was_training = model.training
-    model.eval()
+    # Swap in EMA weights for eval
+    tmp = UNetSR()
+    tmp.load_state_dict(model.state_dict(), strict=False)
+    ema.copy_to(tmp)
+    tmp.to(device).eval()
 
-    # Swap in EMA weights
-    backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
-    ema.copy_to(model)
+    psnrs, ssims = [], []
+    it = 0
+    for lr_patch, hr_patch in val_loader:
+        lr_patch = lr_patch.to(device, non_blocking=True)
+        hr_patch = hr_patch.to(device, non_blocking=True)
 
-    acc_psnr: list[float] = []
-    acc_ssim: list[float] = []
+        sr_patch = euler_sampler(tmp, lr_patch, steps=steps, scale=scale)
+        psnrs.append(float(psnr(sr_patch, hr_patch)))
+        ssims.append(float(ssim(sr_patch, hr_patch)))
 
-    # Small, quiet bar for validation progress
-    val_bar = tqdm(total=max_batches, desc="val", unit="batch", dynamic_ncols=True, leave=False)
-
-    batches_done = 0
-    for lr_tensor, hr_tensor in val_loader:
-        lr_tensor = lr_tensor.to(device, non_blocking=True)
-        hr_tensor = hr_tensor.to(device, non_blocking=True)
-
-        sr_tensor = euler_sampler(model, lr_tensor, steps=steps, scale=4)
-        acc_psnr.append(psnr(sr_tensor, hr_tensor))
-        acc_ssim.append(ssim(sr_tensor, hr_tensor))
-
-        batches_done += 1
-        val_bar.update(1)
-        if batches_done >= max_batches:
+        it += 1
+        if it >= max_batches:
             break
 
-    val_bar.close()
-
-    # Restore original weights
-    model.load_state_dict(backup)
-    if was_training:
-        model.train()
-
-    out = {
-        "psnr": float(sum(acc_psnr) / len(acc_psnr)) if acc_psnr else 0.0,
-        "ssim": float(sum(acc_ssim) / len(acc_ssim)) if acc_ssim else 0.0,
+    return {
+        "psnr": float(sum(psnrs) / max(1, len(psnrs))),
+        "ssim": float(sum(ssims) / max(1, len(ssims))),
     }
-    return out
 
 
-# -------------------------
-# Training loop
-# -------------------------
-
+# Train
 def train(config: Dict[str, Any]) -> None:
+    seed_everything(int(config["train"].get("seed", 42)))
     device = get_device()
-    seed_everything(1337)
     exp_dir = prepare_experiment_dir(config)
 
-    # Data (train: random crops; val: crops for speed — full-image tiling comes in sample.py)
     train_loader = make_dataloader(
         hr_dir=config["paths"]["train_hr_dir"],
         scale=config["data"]["scale"],
@@ -174,54 +149,46 @@ def train(config: Dict[str, Any]) -> None:
         persistent_workers=False,
     )
 
-    # Model
     model = UNetSR(
         in_channels=6,
         out_channels=3,
         base_channels=48,
         channel_multipliers=(1, 2, 4),
-        num_res_blocks=2,
-        time_dim=256,
-        use_bottleneck_attention=True,
-        use_gradient_checkpointing=bool(config["train"].get("grad_checkpoint", True)),
+        num_blocks=int(config.get("model", {}).get("num_blocks", 2)),
+        groups=int(config.get("model", {}).get("groups", 8)),
     ).to(device)
 
-    # Optimizer
     base_lr = float(config["train"]["lr"])
     optimizer = optim.AdamW(model.parameters(), lr=base_lr)
 
-    # EMA
     ema = EMA(model, decay=float(config["train"]["ema_decay"]))
 
-    # AMP
     use_amp = bool(config["train"].get("amp", True))
     is_cuda = (device.type == "cuda")
-    scaler = GradScaler(device="cuda", enabled=(use_amp and is_cuda))
     amp_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if (use_amp and is_cuda) else nullcontext()
+    scaler = GradScaler(enabled=use_amp and is_cuda)
 
-    # Schedule / logging
-    max_steps = int(config["train"]["max_steps"])
-    grad_accum = int(config["data"]["grad_accum"])
-    log_every = int(config["train"].get("log_every", 200))
-    eval_every = int(config["eval"].get("every_steps", 10000))
-    sampler_steps_default = int(config["fm"]["sampler_default_steps"])
-    grad_clip_val = float(config["train"].get("grad_clip", 0.0))
-
-    # Loss
     loss_fn = nn.MSELoss()
 
-    # Progress tracking
-    step = 0
-    running_loss = 0.0
-    tick_time = time.time()
-
-    # Single progress bar across steps
-    pbar = tqdm(total=max_steps, initial=step, desc="train", unit="step", dynamic_ncols=True, smoothing=0.1)
-
-    # Data iterator (recycled as needed)
-    train_iter = iter(train_loader)
+    train_cfg = config.get("train", {})
+    eval_cfg  = config.get("eval", {})
+    data_cfg  = config.get("data", {})
+    max_steps     = int(train_cfg.get("max_steps", train_cfg.get("steps", 10000)))
+    val_every     = int(eval_cfg.get("every_steps", train_cfg.get("val_every", 50)))
+    save_every    = int(train_cfg.get("save_every", val_every))
+    grad_accum    = int(train_cfg.get("grad_accum", data_cfg.get("grad_accum", 1)))
+    grad_clip_val = float(train_cfg.get("grad_clip", 0.0))
+    sampler_steps = int(config.get("fm", {}).get("sampler_default_steps", 4))
+    scale         = int(data_cfg["scale"])
 
     model.train()
+    step = 0
+    running_loss = 0.0
+    train_iter = iter(train_loader)
+
+    pbar = tqdm(total=max_steps, desc="train", dynamic_ncols=True)
+    t0 = time.time()
+
     while step < max_steps:
         optimizer.zero_grad(set_to_none=True)
 
@@ -248,42 +215,35 @@ def train(config: Dict[str, Any]) -> None:
             scaler.scale(loss).backward()
             running_loss += float(loss.item())
 
-        # Gradient clipping (after unscale)
         if grad_clip_val > 0.0:
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_val)
 
         scaler.step(optimizer)
         scaler.update()
+
         ema.update(model)
 
         step += 1
         pbar.update(1)
 
-        # Periodic logging
-        if step % log_every == 0 or step == 1:
-            elapsed = time.time() - tick_time
-            it_per_sec = log_every / max(elapsed, 1e-6)
-            avg_loss = running_loss / log_every
-            pbar.set_postfix({"loss": f"{avg_loss:.6f}", "it/s": f"{it_per_sec:.2f}", "lr": f"{base_lr:g}"}, refresh=False)
+        if step % 50 == 0:
+            avg_loss = running_loss / 50.0
             running_loss = 0.0
-            tick_time = time.time()
+            pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
 
-        # Eval + checkpoint
-        if step % eval_every == 0:
-            metrics = validate(model, ema, val_loader, device, steps=sampler_steps_default, max_batches=4)
-            pbar.write(f"[eval @ {step}] PSNR={metrics['psnr']:.3f} dB | SSIM={metrics['ssim']:.4f}")
+        if step % val_every == 0:
+            model.eval()
+            metrics = validate(model, ema, val_loader, device, sampler_steps, scale)
+            model.train()
+            pbar.write(f"[val@{step}] PSNR {metrics['psnr']:.2f}  SSIM {metrics['ssim']:.4f}")
+
+        if step % save_every == 0:
             save_checkpoint(exp_dir, step, model, ema, optimizer, scaler, log_fn=pbar.write)
 
-    # Final save
-    save_checkpoint(exp_dir, step, model, ema, optimizer, scaler, log_fn=pbar.write)
+    dt = time.time() - t0
     pbar.close()
-    print("Training complete.")
-
-
-# -------------------------
-# CLI
-# -------------------------
+    print(f"Done. Trained {human_readable_num(step)} steps in {dt/60.0:.1f} min.")
 
 def parse_args():
     parser = argparse.ArgumentParser()

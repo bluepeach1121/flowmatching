@@ -8,13 +8,12 @@
 ## 1) Flow Matching (intuitive)
 So in flowmatching, we have 2 distribution, noise and the target distribution . Then we define a simple path from the noise to the HR image and train the network to predict the velocity (velocity is a vector) that keeps a sample moving along that path. The neural network becomes a vector field in which we can give it a sample at a given time and were gonna get the velocity. At inference we start from noise and integrate the learned velocity field for a few steps to reach the SR output.
 
-We purposely use the straight‑line path so the target velocity is constant along the path—great for stability and its just easier to understand.
+We purposely use the straight‑line path so the target velocity is constant along the path. Good for stability and its just easier to understand.
 
 ---
 
 ## 2) Training
 - Starting with only 1k optimizer steps we saw very low metrics: PSNR ≈ 6–7 dB, SSIM ≈ 0.04–0.05.
-- As we kept training, quality improved rapidly, then slowed down.
 - After 10k steps on DIV2K with our small GPU, we reached PSNR = 27.21 dB and SSIM = 0.9069.
 ---
 
@@ -77,5 +76,5 @@ Sampling grids (bicubic | ours | HR) land under `runs/sr_x4/samples/`.
 ---
 
 ## 9) Environment
-Single **RTX 2050 (4 GB)**, HR crop 192, **effective batch 16** (`batch_size=4`, `grad_accum=4`).  
+Single **RTX 2050 (4 GB)**, HR crop 192, **effective batch 16** (`batch_size=4`, `grad_accum=4`). Took about 188.3 minutes to train.  
 Mixed precision via `torch.amp`; simple local logging and periodic checkpoints.

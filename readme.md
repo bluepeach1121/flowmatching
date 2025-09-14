@@ -1,7 +1,7 @@
 # Super-Resolution with Flow Matching (x4)
 
 > I read a blog and paper on Flowmatching so I decided to have a try at it...  I learnt A LOT about batch size, Normalisation(Group,layer,Batch), nondeterminism and their importance in training..
->https://arxiv.org/abs/2210.02747 and https://github.com/facebookresearch/flow_matching were helpful.. the examples in the repository are very helpful to get the intuition.
+>https://arxiv.org/abs/2210.02747 and https://github.com/facebookresearch/flow_matching were helpful.. the examples in the repository are very helpful to get the intuition. My results are in the runs/sr_x4/samples. check section 6 below for how the grids are arranged.
 
 ---
 
@@ -60,7 +60,11 @@ Key knobs in `config.yaml`:
 - `eval.every_steps`
 - `fm.sampler_default_steps` (validation/inference ODE steps)
 
-Sampling grids (bicubic | ours | HR) land under `runs/sr_x4/samples/`.
+to run sampler:
+```bash
+python sample.py --config config.yaml --ckpt runs/sr_x4/checkpoints/step_10000.pt
+```
+Press ctrl+C to stop it running, cuz it runs indefinitely.Sampling grids (bicubic | ours | HR) land under `runs/sr_x4/samples/`.
 
 ---
 

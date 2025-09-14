@@ -66,6 +66,14 @@ python sample.py --config config.yaml --ckpt runs/sr_x4/checkpoints/step_10000.p
 ```
 Press ctrl+C to stop it running, cuz it runs indefinitely.Sampling grids (bicubic | ours | HR) land under `runs/sr_x4/samples/`.
 
+filename convention:
+
+x4 = the upscaling factor (scale=4).
+We downsample HR to LR by 4 and then super-resolve back ×4.
+
+s8 = the number of sampler steps you used (here, 8 Euler steps).
+You can change it at run time with --steps N.
+
 ---
 
 ## 7)checkpoints

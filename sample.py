@@ -44,20 +44,18 @@ def list_images(root: Path) -> List[Path]:
 
 
 def load_model(config, ckpt_path: Path, device: torch.device) -> UNetSR:
-    """Instantiate UNetSR and load weights (EMA preferred if available)."""
+    """Instantiate UNetSR and load weights"""
     model = UNetSR(
         in_channels=6,
         out_channels=3,
         base_channels=48,
         channel_multipliers=(1, 2, 4),
-        # New API (no FiLM/attention):
         num_blocks=int(config.get("model", {}).get("num_blocks", 2)),
         groups=int(config.get("model", {}).get("groups", 8)),
     ).to(device)
 
     ckpt = torch.load(ckpt_path, map_location=device)
     if isinstance(ckpt, dict) and "ema" in ckpt and isinstance(ckpt["ema"], dict):
-        # Merge EMA weights into model (keep missing buffers from current state)
         model.load_state_dict({**model.state_dict(), **ckpt["ema"]}, strict=False)
         print(f"[load] EMA weights loaded from {ckpt_path.name}")
     else:
@@ -157,7 +155,6 @@ def main():
     scale = int(config["data"]["scale"])
     steps = int(args.steps or config["fm"].get("sampler_default_steps", 4))
 
-    # I/O
     exp_dir = Path(config["paths"]["exp_dir"])
     out_dir = exp_dir / "samples"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -193,7 +190,6 @@ def main():
             lr_t.unsqueeze(0), size=hr_t.shape[-2:], mode="bicubic", align_corners=False
         ).squeeze(0).clamp(0, 1)
 
-        # --- Save: bicubic, SR, and a 3-panel grid [bicubic | SR | HR] ---
         stem = p.stem
         grid = make_grid([bicubic_t.cpu(), sr_t.cpu(), hr_t.cpu()], nrow=3, padding=4)
         save_image(grid, out_dir / f"{stem}_grid_x{scale}_s{steps}.png")
